@@ -10,6 +10,7 @@ import CoreVideo
 import ScreenCaptureKit
 import VideoToolbox
 import Network
+import AppKit
 
 setvbuf(stdout, nil, _IOLBF, 0)
 
@@ -215,7 +216,7 @@ final class Capturer: NSObject, SCStreamOutput, SCStreamDelegate {
         sc.minimumFrameInterval = CMTime(value: 1, timescale: CMTimeScale(c.fps))
         sc.pixelFormat = kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
         sc.colorMatrix = CGDisplayStream.yCbCrMatrix_ITU_R_709_2
-        sc.showsCursor = true
+        sc.showsCursor = false                // cursor is sent separately (type 2/3) and drawn on the tablet
         sc.queueDepth = 6
         sc.capturesAudio = false
         let s = SCStream(filter: filter, configuration: sc, delegate: self)
@@ -259,6 +260,7 @@ final class Server {
     private var ws: NWListener?
     private let c: Config
     var onKeyRequest: (() -> Void)?
+    var onClientReady: (() -> Void)?
 
     init(_ c: Config) { self.c = c }
 
@@ -306,6 +308,7 @@ final class Server {
                 conn.send(content: Data(hello.utf8), contentContext: NWConnection.ContentContext(identifier: "hello", metadata: [tm]),
                           isComplete: true, completion: .idempotent)
                 self.onKeyRequest?()
+                self.onClientReady?()
             case .failed, .cancelled:
                 if self.clients.removeValue(forKey: key) != nil { log("client disconnected (\(self.clients.count))") }
             default: break
@@ -324,6 +327,19 @@ final class Server {
                 self.onKeyRequest?()
             }
             self.receiveLoop(cl)
+        }
+    }
+
+    /// Small out-of-band messages (cursor). Skipped for clients that are backed up.
+    func sendControl(_ data: Data) {
+        q.async {
+            let meta = NWProtocolWebSocket.Metadata(opcode: .binary)
+            let ctx = NWConnection.ContentContext(identifier: "ctl", metadata: [meta])
+            for cl in self.clients.values where cl.pending < 8 {
+                cl.pending += 1
+                cl.conn.send(content: data, contentContext: ctx, isComplete: true,
+                             completion: .contentProcessed { _ in self.q.async { cl.pending -= 1 } })
+            }
         }
     }
 
@@ -360,7 +376,7 @@ html,body{margin:0;height:100%;background:#000;overflow:hidden;touch-action:none
 canvas{position:fixed;inset:0;width:100vw;height:100vh;object-fit:contain}
 #msg{position:fixed;left:16px;bottom:16px;color:#aaa;font:15px system-ui,sans-serif;background:#0008;padding:6px 10px;border-radius:6px}
 </style></head>
-<body><canvas id="c"></canvas><div id="msg">connecting…</div>
+<body><canvas id="c"></canvas><img id="cur" style="position:fixed;left:0;top:0;display:none;pointer-events:none;will-change:transform"><div id="msg">connecting…</div>
 <script>
 const WSPORT=__WSPORT__;
 const cv=document.getElementById('c'), g=cv.getContext('2d',{alpha:false,desynchronized:true}), msg=document.getElementById('msg');
@@ -386,6 +402,13 @@ function resetDecoder(){
     error:e=>{console.error(e); show('decoder error: '+e.message); resetDecoder(); reqKey();}
   });
 }
+const cur=document.getElementById('cur'); let cw=0,ch=0,hx=0,hy=0,cx=-1,cy=-1,curURL=null;
+function rect(){const r=cv.getBoundingClientRect(),vw=cv.width||16,vh=cv.height||10,s=Math.min(r.width/vw,r.height/vh);return{x:r.left+(r.width-vw*s)/2,y:r.top+(r.height-vh*s)/2,w:vw*s,h:vh*s}}
+function placeCursor(){if(cx<0){cur.style.display='none';return}const r=rect();cur.style.width=(cw*r.w)+'px';cur.style.height=(ch*r.h)+'px';cur.style.transform='translate('+(r.x+cx*r.w-hx*cw*r.w)+'px,'+(r.y+cy*r.h-hy*ch*r.h)+'px)';cur.style.display='block'}
+function cursorMsg(u8){const dv=new DataView(u8.buffer,u8.byteOffset,u8.byteLength);
+  if(u8[0]===2){cx=dv.getFloat32(1,true);cy=dv.getFloat32(5,true);requestAnimationFrame(placeCursor);}
+  else if(u8[0]===3){hx=dv.getFloat32(1,true);hy=dv.getFloat32(5,true);cw=dv.getFloat32(9,true);ch=dv.getFloat32(13,true);
+    if(curURL)URL.revokeObjectURL(curURL);curURL=URL.createObjectURL(new Blob([u8.subarray(17)],{type:'image/png'}));cur.src=curURL;placeCursor();}}
 function reqKey(){needKey=true; if(ws&&ws.readyState===1) ws.send('key');}
 function connect(){
   ws=new WebSocket('ws://'+location.hostname+':'+WSPORT);
@@ -394,6 +417,7 @@ function connect(){
   ws.onmessage=e=>{
     if(typeof e.data==='string') return;
     const u8=new Uint8Array(e.data), key=u8[0]===1, data=u8.subarray(1);
+    if(u8[0]>=2){cursorMsg(u8);return;}
     if(needKey&&!key) return;
     if(key){
       const c=codecOf(data);
@@ -418,6 +442,81 @@ if(!('VideoDecoder' in window)){
 </body></html>
 """#
 
+// MARK: - Cursor (sent out-of-band so it doesn't wait for capture/encode/decode)
+//
+//  type 2: [2][f32 x][f32 y]                       normalized to the virtual display (x<0 => hidden)
+//  type 3: [3][f32 hotX][f32 hotY][f32 w][f32 h][PNG]  hot spot in 0..1 of the image, w/h relative to display size
+
+final class CursorTracker {
+    private let displayID: CGDirectDisplayID
+    private let send: (Data) -> Void
+    private var timer: DispatchSourceTimer?
+    private var lastPos: (Float, Float) = (-2, -2)
+    private var lastImageKey = 0
+    private var lastImageMsg: Data?
+    private var tick = 0
+
+    init(displayID: CGDirectDisplayID, send: @escaping (Data) -> Void) {
+        self.displayID = displayID; self.send = send
+    }
+
+    func start() {
+        let t = DispatchSource.makeTimerSource(queue: .main)
+        t.schedule(deadline: .now(), repeating: .milliseconds(8), leeway: .milliseconds(1))   // ~120Hz
+        t.setEventHandler { [weak self] in self?.poll() }
+        t.resume()
+        timer = t
+    }
+
+    func stop() { timer?.cancel(); timer = nil }
+
+    /// Re-send current cursor (new client).
+    func resend() {
+        DispatchQueue.main.async {
+            if let m = self.lastImageMsg { self.send(m) }
+            self.lastPos = (-2, -2)
+        }
+    }
+
+    private static func f32(_ v: Float, into d: inout Data) {
+        var x = v.bitPattern.littleEndian
+        withUnsafeBytes(of: &x) { d.append(contentsOf: $0) }
+    }
+
+    private func poll() {
+        let b = CGDisplayBounds(displayID)
+        guard b.width > 0, let loc = CGEvent(source: nil)?.location else { return }
+        tick += 1
+        if tick % 12 == 1 { updateImage(bounds: b) }    // ~10Hz shape check
+        var x = Float((loc.x - b.minX) / b.width), y = Float((loc.y - b.minY) / b.height)
+        if x < 0 || x > 1 || y < 0 || y > 1 { x = -1; y = -1 }
+        if (x, y) == lastPos { return }
+        lastPos = (x, y)
+        var d = Data([2]); Self.f32(x, into: &d); Self.f32(y, into: &d)
+        send(d)
+    }
+
+    private func updateImage(bounds b: CGRect) {
+        guard let cur = NSCursor.currentSystem else { return }
+        let img = cur.image
+        let key = img.hashValue ^ Int(img.size.width * 1000 + img.size.height) ^ Int(cur.hotSpot.x * 7 + cur.hotSpot.y * 13) ^ Int(b.width)
+        if key == lastImageKey { return }
+        guard let cg = img.cgImage(forProposedRect: nil, context: nil, hints: nil),
+              let png = NSBitmapImageRep(cgImage: cg).representation(using: .png, properties: [:]) else { return }
+        // NSImage identity can change for the same cursor; skip if bytes identical
+        var d = Data([3])
+        Self.f32(Float(cur.hotSpot.x / img.size.width), into: &d)
+        Self.f32(Float(cur.hotSpot.y / img.size.height), into: &d)
+        Self.f32(Float(img.size.width / b.width), into: &d)
+        Self.f32(Float(img.size.height / b.height), into: &d)
+        d.append(png)
+        lastImageKey = key
+        if d == lastImageMsg { return }
+        lastImageMsg = d
+        send(d)
+    }
+}
+
 // MARK: - Session (virtual display + capture lifetime)
 
 final class Session {
@@ -426,6 +525,9 @@ final class Session {
     private let c: Config
     private let encoder: Encoder
     private var busy = false
+    private var cursor: CursorTracker?
+    var sendControl: ((Data) -> Void)?
+    func resendCursor() { cursor?.resend() }
     var active: Bool { vd != nil }
 
     init(_ c: Config, encoder: Encoder) { self.c = c; self.encoder = encoder }
@@ -445,6 +547,9 @@ final class Session {
         do {
             try await cp.start(displayID: v.id, c: c)
             cap = cp
+            let ct = CursorTracker(displayID: v.id) { [weak self] d in self?.sendControl?(d) }
+            ct.start()
+            cursor = ct
         } catch {
             log("capture failed: \(error.localizedDescription)")
             log("→ 시스템 설정 > 개인정보 보호 및 보안 > 화면 및 시스템 오디오 녹화 에서 TabDisplay를 허용하세요.")
@@ -459,6 +564,8 @@ final class Session {
         busy = true; defer { busy = false }
         await cap?.stop()
         cap = nil
+        cursor?.stop()
+        cursor = nil
         vd = nil          // releasing CGVirtualDisplay removes the display
         log("virtual display off")
     }
@@ -561,6 +668,8 @@ server.onKeyRequest = { encoder.requestKeyframe() }
 do { try server.start() } catch { log("server start failed: \(error)"); exit(1) }
 
 let session = Session(cfg, encoder: encoder)
+session.sendControl = { d in server.sendControl(d) }
+server.onClientReady = { session.resendCursor() }
 var watcher: AdbWatcher?
 if cfg.adb {
     log("watching adb (\(adbPath)) for tablet…")
