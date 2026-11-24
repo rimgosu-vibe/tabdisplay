@@ -261,6 +261,7 @@ final class Server {
     private let c: Config
     var onKeyRequest: (() -> Void)?
     var onClientReady: (() -> Void)?
+    var onInput: ((Data) -> Void)?
 
     init(_ c: Config) { self.c = c }
 
@@ -322,9 +323,12 @@ final class Server {
         cl.conn.receiveMessage { [weak self] data, _, _, err in
             guard let self else { return }
             if err != nil { cl.conn.cancel(); return }
-            if let data, String(data: data, encoding: .utf8) == "key" {
-                cl.needKey = true
-                self.onKeyRequest?()
+            if let data, data.count > 0 {
+                if data.first! >= 10 { self.onInput?(data) }               // touch input (binary)
+                else if String(data: data, encoding: .utf8) == "key" {
+                    cl.needKey = true
+                    self.onKeyRequest?()
+                }
             }
             self.receiveLoop(cl)
         }
@@ -517,6 +521,76 @@ final class CursorTracker {
     }
 }
 
+// MARK: - Touch input from the tablet -> Mac mouse events
+//
+//  [10][f32 x][f32 y]  down     (x,y normalized to the virtual display)
+//  [11][f32 x][f32 y]  move/drag
+//  [12][f32 x][f32 y]  up
+//  [13][f32 dx][f32 dy] scroll   (normalized deltas, finger direction)
+//  [14][f32 x][f32 y]  right click
+
+final class TouchInput {
+    private let displayID: CGDirectDisplayID
+    private var down = false
+    private var lastUp = Date.distantPast
+    private var lastUpPt = CGPoint.zero
+    private var clickState: Int64 = 1
+    private var warned = false
+
+    init(displayID: CGDirectDisplayID) { self.displayID = displayID }
+
+    private func f32(_ d: Data, _ o: Int) -> CGFloat {
+        CGFloat(Float(bitPattern: d.subdata(in: o..<o+4).withUnsafeBytes { $0.loadUnaligned(as: UInt32.self) }.littleEndian))
+    }
+
+    private func trusted() -> Bool {
+        if AXIsProcessTrusted() { return true }
+        if !warned {
+            warned = true
+            let opt = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary
+            _ = AXIsProcessTrustedWithOptions(opt)
+            log("터치 입력: 시스템 설정 > 개인정보 보호 및 보안 > 손쉬운 사용 에서 TabDisplay를 허용하세요")
+        }
+        return false
+    }
+
+    private func post(_ type: CGEventType, _ p: CGPoint, button: CGMouseButton = .left, clicks: Int64 = 1) {
+        guard let e = CGEvent(mouseEventSource: nil, mouseType: type, mouseCursorPosition: p, mouseButton: button) else { return }
+        e.setIntegerValueField(.mouseEventClickState, value: clicks)
+        e.post(tap: .cghidEventTap)
+    }
+
+    func handle(_ d: Data) {
+        guard d.count >= 9, trusted() else { return }
+        let b = CGDisplayBounds(displayID)
+        guard b.width > 0 else { return }
+        let a = f32(d, 1), c = f32(d, 5)
+        let p = CGPoint(x: b.minX + min(max(a, 0), 1) * (b.width - 1), y: b.minY + min(max(c, 0), 1) * (b.height - 1))
+        switch d[0] {
+        case 10:
+            // double-click detection (needed for e.g. YouTube fullscreen)
+            if Date().timeIntervalSince(lastUp) < 0.4 && hypot(p.x - lastUpPt.x, p.y - lastUpPt.y) < 12 { clickState += 1 } else { clickState = 1 }
+            down = true
+            post(.leftMouseDown, p, clicks: clickState)
+        case 11:
+            post(down ? .leftMouseDragged : .mouseMoved, p, clicks: clickState)
+        case 12:
+            if down { post(.leftMouseUp, p, clicks: clickState) }
+            down = false
+            lastUp = Date(); lastUpPt = p
+        case 13:
+            let dx = Int32((a * b.width).rounded()), dy = Int32((c * b.height).rounded())
+            if let e = CGEvent(scrollWheelEvent2Source: nil, units: .pixel, wheelCount: 2, wheel1: dy, wheel2: dx, wheel3: 0) {
+                e.post(tap: .cghidEventTap)
+            }
+        case 14:
+            post(.rightMouseDown, p, button: .right)
+            post(.rightMouseUp, p, button: .right)
+        default: break
+        }
+    }
+}
+
 // MARK: - Session (virtual display + capture lifetime)
 
 final class Session {
@@ -528,6 +602,8 @@ final class Session {
     private var cursor: CursorTracker?
     var sendControl: ((Data) -> Void)?
     func resendCursor() { cursor?.resend() }
+    private var touch: TouchInput?
+    func handleInput(_ d: Data) { DispatchQueue.main.async { self.touch?.handle(d) } }
     var active: Bool { vd != nil }
 
     init(_ c: Config, encoder: Encoder) { self.c = c; self.encoder = encoder }
@@ -550,6 +626,7 @@ final class Session {
             let ct = CursorTracker(displayID: v.id) { [weak self] d in self?.sendControl?(d) }
             ct.start()
             cursor = ct
+            touch = TouchInput(displayID: v.id)
         } catch {
             log("capture failed: \(error.localizedDescription)")
             log("→ 시스템 설정 > 개인정보 보호 및 보안 > 화면 및 시스템 오디오 녹화 에서 TabDisplay를 허용하세요.")
@@ -566,6 +643,7 @@ final class Session {
         cap = nil
         cursor?.stop()
         cursor = nil
+        touch = nil
         vd = nil          // releasing CGVirtualDisplay removes the display
         log("virtual display off")
     }
@@ -670,6 +748,7 @@ do { try server.start() } catch { log("server start failed: \(error)"); exit(1) 
 let session = Session(cfg, encoder: encoder)
 session.sendControl = { d in server.sendControl(d) }
 server.onClientReady = { session.resendCursor() }
+server.onInput = { d in session.handleInput(d) }
 var watcher: AdbWatcher?
 if cfg.adb {
     log("watching adb (\(adbPath)) for tablet…")

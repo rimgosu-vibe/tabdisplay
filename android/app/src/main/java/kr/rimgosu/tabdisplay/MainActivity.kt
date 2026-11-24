@@ -17,6 +17,8 @@ import android.os.Handler
 import android.os.Looper
 import android.util.Log
 import android.view.Gravity
+import android.view.MotionEvent
+import android.view.ViewConfiguration
 import android.view.Surface
 import android.view.SurfaceHolder
 import android.view.SurfaceView
@@ -32,6 +34,7 @@ import okhttp3.Response
 import okhttp3.WebSocket
 import okhttp3.WebSocketListener
 import okio.ByteString
+import okio.ByteString.Companion.toByteString
 import org.json.JSONObject
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
@@ -184,6 +187,91 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         } finally {
             holder.unlockCanvasAndPost(c)
         }
+    }
+
+    // ---- touch -> Mac mouse (types 10..14, see mac/Sources/main.swift TouchInput) ----
+    //  tap = click (double tap = double click), 1-finger drag = mouse drag,
+    //  2-finger drag = scroll, long press = right click
+
+    private enum class TMode { IDLE, PENDING, DRAG, SCROLL, DONE }
+    private var tMode = TMode.IDLE
+    private var downX = 0f
+    private var downY = 0f
+    private var lastFx = 0f
+    private var lastFy = 0f
+    private val touchSlop by lazy { ViewConfiguration.get(this).scaledTouchSlop.toFloat() }
+    private val longPress = Runnable {
+        if (tMode == TMode.PENDING) { tMode = TMode.DONE; sendTouch(14, downX, downY) }
+    }
+
+    private fun sendTouch(type: Int, x: Float, y: Float, normalized: Boolean = false) {
+        val w = root.width.toFloat(); val h = root.height.toFloat()
+        if (w <= 0f || h <= 0f) return
+        val bb = ByteBuffer.allocate(9).order(ByteOrder.LITTLE_ENDIAN)
+        bb.put(type.toByte())
+        bb.putFloat(if (normalized) x else x / w)
+        bb.putFloat(if (normalized) y else y / h)
+        ws?.send(bb.array().toByteString())
+    }
+
+    private fun focus(e: MotionEvent): Pair<Float, Float> {
+        var sx = 0f; var sy = 0f
+        val skip = if (e.actionMasked == MotionEvent.ACTION_POINTER_UP) e.actionIndex else -1
+        var n = 0
+        for (i in 0 until e.pointerCount) if (i != skip) { sx += e.getX(i); sy += e.getY(i); n++ }
+        return if (n == 0) e.x to e.y else (sx / n) to (sy / n)
+    }
+
+    override fun dispatchTouchEvent(e: MotionEvent): Boolean {
+        when (e.actionMasked) {
+            MotionEvent.ACTION_DOWN -> {
+                tMode = TMode.PENDING
+                downX = e.x; downY = e.y
+                sendTouch(11, downX, downY)               // move the pointer there (hover)
+                main.postDelayed(longPress, 600)
+            }
+            MotionEvent.ACTION_POINTER_DOWN -> {
+                if (tMode == TMode.PENDING) {
+                    main.removeCallbacks(longPress)
+                    tMode = TMode.SCROLL
+                }
+                if (tMode == TMode.SCROLL) { val (fx, fy) = focus(e); lastFx = fx; lastFy = fy }
+            }
+            MotionEvent.ACTION_POINTER_UP -> {
+                if (tMode == TMode.SCROLL) { val (fx, fy) = focus(e); lastFx = fx; lastFy = fy }
+            }
+            MotionEvent.ACTION_MOVE -> when (tMode) {
+                TMode.PENDING -> if (Math.hypot((e.x - downX).toDouble(), (e.y - downY).toDouble()) > touchSlop) {
+                    main.removeCallbacks(longPress)
+                    tMode = TMode.DRAG
+                    sendTouch(10, downX, downY)
+                    sendTouch(11, e.x, e.y)
+                }
+                TMode.DRAG -> sendTouch(11, e.x, e.y)
+                TMode.SCROLL -> {
+                    val (fx, fy) = focus(e)
+                    val w = root.width.toFloat(); val h = root.height.toFloat()
+                    if (w > 0f && h > 0f) sendTouch(13, (fx - lastFx) / w, (fy - lastFy) / h, normalized = true)
+                    lastFx = fx; lastFy = fy
+                }
+                else -> {}
+            }
+            MotionEvent.ACTION_UP -> {
+                main.removeCallbacks(longPress)
+                when (tMode) {
+                    TMode.PENDING -> { sendTouch(10, downX, downY); sendTouch(12, downX, downY) }
+                    TMode.DRAG -> sendTouch(12, e.x, e.y)
+                    else -> {}
+                }
+                tMode = TMode.IDLE
+            }
+            MotionEvent.ACTION_CANCEL -> {
+                main.removeCallbacks(longPress)
+                if (tMode == TMode.DRAG) sendTouch(12, e.x, e.y)
+                tMode = TMode.IDLE
+            }
+        }
+        return true
     }
 
     @Suppress("DEPRECATION")

@@ -1,7 +1,10 @@
 # TabDisplay
 
 Android 태블릿을 macOS 확장 모니터로 쓰는 도구. USB(adb)로 연결하면 Mac에 가상 디스플레이가 생기고,
-그 화면이 태블릿에 전체화면으로 스트리밍된다. 유튜브 띄워두기 같은 "보기" 용도 (터치 입력 없음, 소리는 Mac에서).
+그 화면이 태블릿에 전체화면으로 스트리밍된다. 유튜브 띄워두기 같은 용도. 소리는 Mac에서 나온다.
+
+터치: 탭=클릭(두 번 탭=더블클릭), 한 손가락 드래그=마우스 드래그, 두 손가락 드래그=스크롤, 길게 누르기=우클릭.
+터치 입력에는 Mac에서 TabDisplay의 **손쉬운 사용** 권한이 필요하다.
 
 ```
 Mac: CGVirtualDisplay ─▶ ScreenCaptureKit ─▶ VideoToolbox H.264 ─▶ WebSocket :8801
