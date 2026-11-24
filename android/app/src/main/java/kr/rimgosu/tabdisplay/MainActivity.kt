@@ -1,7 +1,13 @@
 package kr.rimgosu.tabdisplay
 
 import android.app.Activity
+import android.graphics.Bitmap
 import android.graphics.BitmapFactory
+import android.graphics.Paint
+import android.graphics.PixelFormat
+import android.graphics.PorterDuff
+import android.graphics.RectF
+import android.os.HandlerThread
 import android.graphics.Color
 import android.media.MediaCodec
 import android.media.MediaFormat
@@ -19,7 +25,6 @@ import android.view.WindowInsets
 import android.view.WindowInsetsController
 import android.view.WindowManager
 import android.widget.FrameLayout
-import android.widget.ImageView
 import android.widget.TextView
 import okhttp3.OkHttpClient
 import okhttp3.Request
@@ -53,11 +58,21 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
 
     private lateinit var status: TextView
     private lateinit var root: FrameLayout
-    private lateinit var cursor: ImageView
+    // Cursor is drawn on its own translucent surface stacked above the video surface.
+    // (A normal View moved over a SurfaceView via translation isn't recomposited reliably.)
+    private lateinit var cursorView: SurfaceView
+    private val cursorThread = HandlerThread("cursor").apply { start() }
+    private val cursorHandler = Handler(cursorThread.looper)
+    private val cursorPaint = Paint(Paint.FILTER_BITMAP_FLAG or Paint.ANTI_ALIAS_FLAG)
+    @Volatile private var cursorReady = false
+    @Volatile private var cursorDirty = false
+    @Volatile private var cursorBmp: Bitmap? = null
     @Volatile private var curX = -1f
     @Volatile private var curY = -1f
-    private var curW = 0f; private var curH = 0f; private var hotX = 0f; private var hotY = 0f
-    private var cursorPosted = false
+    @Volatile private var curW = 0f
+    @Volatile private var curH = 0f
+    @Volatile private var hotX = 0f
+    @Volatile private var hotY = 0f
     private val frames = LinkedBlockingQueue<Frame>()
 
     @Volatile private var ws: WebSocket? = null
@@ -89,8 +104,19 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         root.addView(status, FrameLayout.LayoutParams(-2, -2, Gravity.START or Gravity.BOTTOM).apply {
             setMargins(40, 40, 40, 40)
         })
-        cursor = ImageView(this).apply { visibility = View.GONE; scaleType = ImageView.ScaleType.FIT_XY }
-        root.addView(cursor, FrameLayout.LayoutParams(1, 1))
+        cursorView = SurfaceView(this).apply {
+            setZOrderMediaOverlay(true)
+            holder.setFormat(PixelFormat.TRANSLUCENT)
+            holder.addCallback(object : SurfaceHolder.Callback {
+                override fun surfaceCreated(h: SurfaceHolder) { cursorReady = true; scheduleCursor() }
+                override fun surfaceChanged(h: SurfaceHolder, f: Int, w: Int, hh: Int) = scheduleCursor()
+                override fun surfaceDestroyed(h: SurfaceHolder) {
+                    cursorReady = false
+                    cursorHandler.runWithScissors({}, 500)   // wait for an in-flight draw to finish
+                }
+            })
+        }
+        root.addView(cursorView, FrameLayout.LayoutParams(-1, -1))
         setContentView(root)
         hideSystemUi()
         preferHighRefreshRate()
@@ -109,7 +135,10 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         val best = d.supportedModes
             .filter { it.physicalWidth == cur.physicalWidth && it.physicalHeight == cur.physicalHeight }
             .maxByOrNull { it.refreshRate } ?: return
-        window.attributes = window.attributes.apply { preferredDisplayModeId = best.modeId }
+        window.attributes = window.attributes.apply {
+            preferredDisplayModeId = best.modeId
+            preferredRefreshRate = best.refreshRate
+        }
         Log.i(tag, "display mode ${best.refreshRate}Hz")
     }
 
@@ -119,32 +148,40 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         val bb = ByteBuffer.wrap(b).order(ByteOrder.LITTLE_ENDIAN)
         if (b[0].toInt() == 2 && b.size >= 9) {
             curX = bb.getFloat(1); curY = bb.getFloat(5)
-            synchronized(this) {
-                if (cursorPosted) return
-                cursorPosted = true
-            }
-            root.postOnAnimation { synchronized(this) { cursorPosted = false }; placeCursor() }
         } else if (b[0].toInt() == 3 && b.size > 17) {
-            val hx = bb.getFloat(1); val hy = bb.getFloat(5); val w = bb.getFloat(9); val h = bb.getFloat(13)
             val bmp = BitmapFactory.decodeByteArray(b, 17, b.size - 17) ?: return
-            main.post {
-                hotX = hx; hotY = hy; curW = w; curH = h
-                cursor.setImageBitmap(bmp)
-                placeCursor()
-            }
-        }
+            hotX = bb.getFloat(1); hotY = bb.getFloat(5); curW = bb.getFloat(9); curH = bb.getFloat(13)
+            cursorBmp = bmp
+        } else return
+        scheduleCursor()
     }
 
-    private fun placeCursor() {
-        val vw = root.width.toFloat(); val vh = root.height.toFloat()
-        if (curX < 0 || curW <= 0f || vw <= 0f) { cursor.visibility = View.GONE; return }
-        // video is scaled to fill the view (same 16:10 aspect)
-        val w = (curW * vw).toInt().coerceAtLeast(1); val h = (curH * vh).toInt().coerceAtLeast(1)
-        val lp = cursor.layoutParams
-        if (lp.width != w || lp.height != h) { lp.width = w; lp.height = h; cursor.layoutParams = lp }
-        cursor.translationX = curX * vw - hotX * w
-        cursor.translationY = curY * vh - hotY * h
-        cursor.visibility = View.VISIBLE
+    /** Coalesces cursor updates; each draw blocks until the next vsync buffer is free. */
+    private fun scheduleCursor() {
+        if (cursorDirty) return
+        cursorDirty = true
+        cursorHandler.post { cursorDirty = false; drawCursor() }
+    }
+
+    private fun drawCursor() {
+        if (!cursorReady) return
+        val holder = cursorView.holder
+        val c = try {
+            if (Build.VERSION.SDK_INT >= 26) holder.lockHardwareCanvas() else holder.lockCanvas()
+        } catch (e: Exception) { null } ?: return
+        try {
+            c.drawColor(0, PorterDuff.Mode.CLEAR)
+            val bmp = cursorBmp
+            if (bmp != null && curX >= 0f && curW > 0f) {
+                // video fills the view (same 16:10 aspect), so normalized coords map directly
+                val vw = c.width.toFloat(); val vh = c.height.toFloat()
+                val w = curW * vw; val h = curH * vh
+                val l = curX * vw - hotX * w; val t = curY * vh - hotY * h
+                c.drawBitmap(bmp, null, RectF(l, t, l + w, t + h), cursorPaint)
+            }
+        } finally {
+            holder.unlockCanvasAndPost(c)
+        }
     }
 
     @Suppress("DEPRECATION")
@@ -247,6 +284,9 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
 
     override fun surfaceCreated(holder: SurfaceHolder) {
         surface = holder.surface
+        if (Build.VERSION.SDK_INT >= 30) runCatching {
+            holder.surface.setFrameRate(120f, Surface.FRAME_RATE_COMPATIBILITY_DEFAULT)
+        }
         restartDecoder()
     }
 
