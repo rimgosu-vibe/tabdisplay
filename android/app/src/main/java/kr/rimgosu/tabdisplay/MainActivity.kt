@@ -112,7 +112,9 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
                 override fun surfaceChanged(h: SurfaceHolder, f: Int, w: Int, hh: Int) = scheduleCursor()
                 override fun surfaceDestroyed(h: SurfaceHolder) {
                     cursorReady = false
-                    cursorHandler.runWithScissors({}, 500)   // wait for an in-flight draw to finish
+                    val l = java.util.concurrent.CountDownLatch(1)          // wait for an in-flight draw to finish
+                    cursorHandler.post { l.countDown() }
+                    l.await(500, TimeUnit.MILLISECONDS)
                 }
             })
         }
