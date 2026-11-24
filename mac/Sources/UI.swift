@@ -38,9 +38,13 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
         statusItem.menu = menu
 
         // First launch: turn on "open at login" by default (user can turn it off in System Settings).
-        if !UserDefaults.standard.bool(forKey: "loginItemAutoRegistered") {
-            UserDefaults.standard.set(true, forKey: "loginItemAutoRegistered")
-            if isInApplications { try? SMAppService.mainApp.register() }
+        // (only once, and only from /Applications — afterwards the user's choice in System Settings wins)
+        if isInApplications && !UserDefaults.standard.bool(forKey: "loginItemAutoRegisteredV2") {
+            UserDefaults.standard.set(true, forKey: "loginItemAutoRegisteredV2")
+            if loginStatus != .enabled {
+                do { try SMAppService.mainApp.register(); log("login item registered") }
+                catch { log("login item register failed: \(error)") }
+            }
         }
 
         timer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in self?.refresh() }
@@ -71,8 +75,9 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
     @objc func showSetup() {
         if window == nil { buildWindow() }
         refresh()
-        NSApp.activate(ignoringOtherApps: true)
+        NSApp.activate()
         window?.makeKeyAndOrderFront(nil)
+        window?.orderFrontRegardless()          // agent apps aren't always allowed to activate
     }
 
     @objc private func openLog() { NSWorkspace.shared.open(URL(fileURLWithPath: logPath)) }
@@ -128,7 +133,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
         let deviceText: String
         switch watcher.state {
         case .noAdb: deviceConnected = false; deviceText = "adb를 찾을 수 없습니다 (앱이 손상됐을 수 있음 — 다시 받아주세요)"
-        case .none: deviceConnected = false; deviceText = "태블릿을 USB로 연결하세요. 처음이라면 태블릿에서 USB 디버깅을 켜야 합니다 → [방법 보기]"
+        case .none: deviceConnected = false; deviceText = "태블릿을 USB로 연결하세요. 처음이라면 태블릿에서 USB 디버깅을 먼저 켜야 합니다."
         case .unauthorized: deviceConnected = false; deviceText = "태블릿 화면의 'USB 디버깅을 허용하시겠습니까?'에서 '이 컴퓨터에서 항상 허용'을 체크하고 [허용]을 누르세요."
         case .connected(let m): deviceConnected = true; deviceText = "\(m) 연결됨"
         }
@@ -172,7 +177,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
                              : watcher.installing ? "설치 중…"
                              : bundledAPK != nil ? "태블릿에 TabDisplay 앱이 없습니다. [설치]를 누르면 USB로 바로 설치합니다."
                              : "태블릿에 TabDisplay 앱이 없습니다. 릴리즈 페이지에서 APK를 받아 설치하세요.",
-                         button: bundledAPK != nil ? "설치" : "다운로드", enabled: inst == false && !watcher.installing)
+                         button: bundledAPK != nil ? "설치" : "다운로드", enabled: !watcher.installing, showButton: inst == false)
         footer.stringValue = "상태: \(status)\n\n화면 배치는 시스템 설정 > 디스플레이 > 정렬에서 바꿀 수 있고, 기기별로 기억됩니다. "
             + "메뉴 막대의 ▭ 아이콘에서 이 창을 다시 열 수 있습니다."
     }
@@ -270,7 +275,7 @@ final class SetupRow: NSStackView {
         title.font = .boldSystemFont(ofSize: 13)
         detail.textColor = .secondaryLabelColor
         detail.font = .systemFont(ofSize: 12)
-        detail.preferredMaxLayoutWidth = 400
+        detail.preferredMaxLayoutWidth = 420
         let text = NSStackView(views: [title, detail])
         text.orientation = .vertical
         text.alignment = .leading
@@ -279,6 +284,8 @@ final class SetupRow: NSStackView {
         icon.setContentHuggingPriority(.required, for: .horizontal)
         button.setContentHuggingPriority(.required, for: .horizontal)
         text.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        text.widthAnchor.constraint(equalToConstant: 420).isActive = true
+        detail.widthAnchor.constraint(equalToConstant: 420).isActive = true
         addArrangedSubview(icon)
         addArrangedSubview(text)
         addArrangedSubview(button)
