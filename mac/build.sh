@@ -4,6 +4,7 @@
 #   - bundles the Android APK as Contents/Resources/TabDisplay.apk if APK_PATH is set
 #   VERSION=x.y.z  APK_PATH=path/to.apk  mac/build.sh
 set -e
+[ -n "$APK_PATH" ] && APK_PATH="${APK_PATH:A}"   # resolve before cd
 cd "${0:A:h}"
 APP=build/TabDisplay.app
 CACHE=build/cache
