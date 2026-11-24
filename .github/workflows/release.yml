@@ -50,13 +50,20 @@ jobs:
           path: dist/*
 
   mac:
+    needs: apk                      # the APK is bundled into TabDisplay.app
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
 
-      - name: Build TabDisplay.app
+      - uses: actions/download-artifact@v4
+        with:
+          name: apk
+          path: apk
+
+      - name: Build TabDisplay.app (bundles adb + APK)
         run: |
           if [[ "$GITHUB_REF_TYPE" == "tag" ]]; then export VERSION="${GITHUB_REF_NAME#v}"; else export VERSION="0.0.0-${GITHUB_SHA::7}"; fi
+          export APK_PATH="$(ls apk/*.apk | head -1)"
           mac/build.sh
           mkdir -p dist
           ditto -c -k --keepParent mac/build/TabDisplay.app "dist/TabDisplay-${VERSION}-macos.zip"
