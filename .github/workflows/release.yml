@@ -1,4 +1,4 @@
-name: android-release
+name: release
 
 on:
   push:
@@ -46,12 +46,37 @@ jobs:
 
       - uses: actions/upload-artifact@v4
         with:
-          name: TabDisplay-apk
-          path: dist/*.apk
+          name: apk
+          path: dist/*
 
-      - name: Publish GitHub release
-        if: github.ref_type == 'tag'
-        uses: softprops/action-gh-release@v2
+  mac:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build TabDisplay.app
+        run: |
+          if [[ "$GITHUB_REF_TYPE" == "tag" ]]; then export VERSION="${GITHUB_REF_NAME#v}"; else export VERSION="0.0.0-${GITHUB_SHA::7}"; fi
+          mac/build.sh
+          mkdir -p dist
+          ditto -c -k --keepParent mac/build/TabDisplay.app "dist/TabDisplay-${VERSION}-macos.zip"
+
+      - uses: actions/upload-artifact@v4
         with:
-          files: dist/*.apk
+          name: mac
+          path: dist/*
+
+  release:
+    if: github.ref_type == 'tag'
+    needs: [apk, mac]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
           generate_release_notes: true

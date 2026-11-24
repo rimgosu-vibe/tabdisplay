@@ -22,13 +22,16 @@ Android: OkHttp WebSocket ─▶ MediaCodec (HW) ─▶ SurfaceView (immersive) 
 ## 설치
 
 ### Mac
+[Releases](../../releases)에서 `TabDisplay-x.y.z-macos.zip`을 받아 풀고 `/Applications`(또는 `~/Applications`)로 옮긴다.
+Apple 공증을 받지 않은 앱이라 처음 한 번은 격리 속성을 지워야 한다:
 ```sh
 brew install --cask android-platform-tools
-mac/build.sh                     # -> mac/build/TabDisplay.app
-open mac/build/TabDisplay.app    # 첫 실행 시 화면 녹화 권한 허용
+xattr -dr com.apple.quarantine /Applications/TabDisplay.app
+open /Applications/TabDisplay.app   # 화면 녹화 / 손쉬운 사용 권한 허용
 ```
+직접 빌드: `mac/build.sh` → `mac/build/TabDisplay.app`
 로그인 시 자동 실행하려면 `~/Library/LaunchAgents`에 `ProgramArguments`가
-`mac/build/TabDisplay.app/Contents/MacOS/tabdisplay`인 LaunchAgent(`RunAtLoad`, `KeepAlive`)를 등록.
+`TabDisplay.app/Contents/MacOS/tabdisplay`인 LaunchAgent(`RunAtLoad`, `KeepAlive`)를 등록.
 로그: `~/Library/Logs/tabdisplay.log`
 
 옵션: `--stream 1920x1200 --fps 60 --mbps 16 --panel 2944x1840 --no-hidpi --no-adb --serial X`
@@ -41,7 +44,7 @@ adb install -r TabDisplay-x.y.z.apk
 APK가 설치돼 있으면 Mac 앱이 연결 시 자동 실행한다(없으면 Chrome으로 `http://localhost:8800` 을 연다).
 
 ## 릴리즈
-`v*` 태그를 push하면 GitHub Actions가 서명된 APK를 빌드해 Release에 올린다.
+`v*` 태그를 push하면 GitHub Actions가 서명된 APK와 macOS 앱(zip)을 빌드해 Release에 올린다.
 서명 키는 repo secret `KEYSTORE_B64`(PKCS#12, alias `tabdisplay`) / `KEYSTORE_PASSWORD`.
 
 > `mac/`은 비공개 API `CGVirtualDisplay`(DeskPad·BetterDisplay와 동일)를 쓴다.
