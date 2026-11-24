@@ -745,6 +745,11 @@ encoder.onFrame = { data, key in server.broadcast(data, isKey: key) }
 server.onKeyRequest = { encoder.requestKeyframe() }
 do { try server.start() } catch { log("server start failed: \(error)"); exit(1) }
 
+// Touch input needs Accessibility; ask once at launch (no-op if already granted).
+if !AXIsProcessTrusted() {
+    _ = AXIsProcessTrustedWithOptions([kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary)
+    log("터치 입력용 '손쉬운 사용' 권한이 없습니다 — 시스템 설정에서 TabDisplay를 허용하세요")
+}
 let session = Session(cfg, encoder: encoder)
 session.sendControl = { d in server.sendControl(d) }
 server.onClientReady = { session.resendCursor() }
