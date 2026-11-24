@@ -1,0 +1,9 @@
+mac/build/
+android/.gradle/
+android/build/
+android/app/build/
+android/local.properties
+.secrets/
+*.p12
+*.jks
+.DS_Store
